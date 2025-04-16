@@ -113,8 +113,10 @@ defmodule Explorer.Chain.AdvancedFilter do
     tasks =
       options
       |> Keyword.put(:block_numbers_age, block_numbers_age)
-      |> queries(paging_options)
-      |> Enum.map(fn query -> Task.async(fn -> Chain.select_repo(options).all(query, timeout: timeout) end) end)
+      |> query_functions(paging_options)
+      |> Enum.map(fn query_function ->
+        Task.async(fn -> query_function.(Chain.select_repo(options), timeout: timeout) end)
+      end)
 
     tasks
     |> Task.yield_many(timeout: timeout, on_timeout: :kill_task)
@@ -140,43 +142,49 @@ defmodule Explorer.Chain.AdvancedFilter do
     )
     |> sanitize_fee()
     |> assign_type()
+    |> Enum.to_list()
   end
 
-  defp queries(options, paging_options) do
+  defp query_functions(options, paging_options) do
     []
     |> maybe_add_transactions_queries(options, paging_options)
     |> maybe_add_token_transfers_queries(options, paging_options)
   end
 
-  defp maybe_add_transactions_queries(queries, options, paging_options) do
+  @transaction_types ["COIN_TRANSFER", "CONTRACT_INTERACTION", "CONTRACT_CREATION"]
+  defp maybe_add_transactions_queries(query_functions, options, paging_options) do
     transaction_types = options[:transaction_types] || []
     tokens_to_include = options[:token_contract_address_hashes][:include] || []
     tokens_to_exclude = options[:token_contract_address_hashes][:exclude] || []
 
-    if (transaction_types == [] or "COIN_TRANSFER" in transaction_types) and
+    if (transaction_types == [] or Enum.any?(@transaction_types, &Enum.member?(transaction_types, &1))) and
          (tokens_to_include == [] or "native" in tokens_to_include) and
          "native" not in tokens_to_exclude do
-      [transactions_query(paging_options, options), internal_transactions_query(paging_options, options) | queries]
+      [
+        transactions_query_function(paging_options, options),
+        internal_transactions_query_function(paging_options, options) | query_functions
+      ]
     else
-      queries
+      query_functions
     end
   end
 
-  defp maybe_add_token_transfers_queries(queries, options, paging_options) do
+  defp maybe_add_token_transfers_queries(query_functions, options, paging_options) do
     transaction_types = options[:transaction_types] || []
     tokens_to_include = options[:token_contract_address_hashes][:include] || []
 
-    if (transaction_types == [] or not (transaction_types |> Enum.reject(&(&1 == "COIN_TRANSFER")) |> Enum.empty?())) and
+    if (transaction_types == [] or not (transaction_types |> Enum.reject(&(&1 in @transaction_types)) |> Enum.empty?())) and
          (tokens_to_include == [] or not (tokens_to_include |> Enum.reject(&(&1 == "native")) |> Enum.empty?())) do
-      [token_transfers_query(paging_options, options) | queries]
+      [token_transfers_query_function(paging_options, options) | query_functions]
     else
-      queries
+      query_functions
     end
   end
 
   defp sanitize_fee(advanced_filters) do
     Stream.scan(advanced_filters, fn
-      %__MODULE__{hash: hash} = advanced_filter, %__MODULE__{hash: hash} ->
+      %__MODULE__{hash: hash, created_from: created_from} = advanced_filter, %__MODULE__{hash: hash}
+      when created_from != :internal_transaction ->
         %__MODULE__{advanced_filter | fee: Decimal.new(0)}
 
       advanced_filter, _ ->
@@ -312,7 +320,7 @@ defmodule Explorer.Chain.AdvancedFilter do
 
   defp take_page_size(list, _), do: list
 
-  defp transactions_query(paging_options, options) do
+  defp transactions_query_function(paging_options, options) do
     query =
       if DenormalizationHelper.transactions_denormalization_finished?() do
         from(transaction in Transaction,
@@ -336,14 +344,17 @@ defmodule Explorer.Chain.AdvancedFilter do
         )
       end
 
-    query
-    |> page_transactions(paging_options)
-    |> limit_query(paging_options)
-    |> apply_transactions_filters(
-      options,
-      fn query -> query |> order_by([transaction], desc: transaction.block_number, desc: transaction.index) end
-    )
-    |> limit_query(paging_options)
+    filtered_and_paginated_query =
+      query
+      |> page_transactions(paging_options)
+      |> limit_query(paging_options)
+      |> apply_transactions_filters(
+        options,
+        fn query -> query |> order_by([transaction], desc: transaction.block_number, desc: transaction.index) end
+      )
+      |> limit_query(paging_options)
+
+    fn repo, repo_options -> repo.all(filtered_and_paginated_query, repo_options) end
   end
 
   defp page_transactions(query, %PagingOptions{
@@ -363,7 +374,7 @@ defmodule Explorer.Chain.AdvancedFilter do
 
   defp page_transactions(query, _), do: query
 
-  defp internal_transactions_query(paging_options, options) do
+  defp internal_transactions_query_function(paging_options, options) do
     query =
       if DenormalizationHelper.transactions_denormalization_finished?() do
         from(internal_transaction in InternalTransaction,
@@ -399,19 +410,22 @@ defmodule Explorer.Chain.AdvancedFilter do
         )
       end
 
-    query
-    |> page_internal_transactions(paging_options)
-    |> limit_query(paging_options)
-    |> apply_transactions_filters(options, fn query ->
+    filtered_and_paginated_query =
       query
-      |> order_by([internal_transaction],
-        desc: internal_transaction.block_number,
-        desc: internal_transaction.transaction_index,
-        desc: internal_transaction.index
-      )
-    end)
-    |> limit_query(paging_options)
-    |> preload([:transaction])
+      |> page_internal_transactions(paging_options)
+      |> limit_query(paging_options)
+      |> apply_transactions_filters(options, fn query ->
+        query
+        |> order_by([internal_transaction],
+          desc: internal_transaction.block_number,
+          desc: internal_transaction.transaction_index,
+          desc: internal_transaction.index
+        )
+      end)
+      |> limit_query(paging_options)
+      |> preload([:transaction])
+
+    fn repo, repo_options -> repo.all(filtered_and_paginated_query, repo_options) end
   end
 
   defp page_internal_transactions(query, %PagingOptions{
@@ -491,12 +505,11 @@ defmodule Explorer.Chain.AdvancedFilter do
 
   defp page_internal_transactions(query, _), do: query
 
-  defp token_transfers_query(paging_options, options) do
+  defp token_transfers_query_function(paging_options, options) do
     token_transfer_query =
       if DenormalizationHelper.transactions_denormalization_finished?() do
         from(token_transfer in TokenTransfer,
           as: :token_transfer,
-          hints: ["token_transfers_denormalized"],
           join: transaction in assoc(token_transfer, :transaction),
           as: :transaction,
           join: token in assoc(token_transfer, :token),
@@ -519,7 +532,6 @@ defmodule Explorer.Chain.AdvancedFilter do
       else
         from(token_transfer in TokenTransfer,
           as: :token_transfer,
-          hints: ["/*+ IndexScan(transactions transactions_has_token_transfers_index) */"],
           join: transaction in assoc(token_transfer, :transaction),
           as: :transaction,
           join: token in assoc(token_transfer, :token),
@@ -548,13 +560,20 @@ defmodule Explorer.Chain.AdvancedFilter do
       |> apply_token_transfers_filters(options)
       |> page_token_transfers(paging_options)
 
-    token_transfer_query
-    |> ExplorerHelper.maybe_hide_scam_addresses(:token_contract_address_hash, options)
-    |> limit_query(paging_options)
-    |> query_function.(false)
-    |> limit_query(paging_options)
-    |> preload([:transaction, :token])
-    |> select_merge([token_transfer], %{token_ids: [token_transfer.token_id], amounts: [token_transfer.amount]})
+    filtered_and_paginated_query =
+      token_transfer_query
+      |> ExplorerHelper.maybe_hide_scam_addresses(:token_contract_address_hash, options)
+      |> limit_query(paging_options)
+      |> query_function.(false)
+      |> limit_query(paging_options)
+      |> select_merge([unnested_token_transfer: unnested_token_transfer], %{
+        token_ids: [unnested_token_transfer.token_id],
+        amounts: [unnested_token_transfer.amount]
+      })
+
+    fn repo, repo_options ->
+      filtered_and_paginated_query |> repo.all(repo_options) |> repo.preload([:transaction, :token])
+    end
   end
 
   defp page_token_transfers(query_function, %PagingOptions{
@@ -787,7 +806,6 @@ defmodule Explorer.Chain.AdvancedFilter do
     query |> where(not is_nil(as(:transaction).block_number) and not is_nil(as(:transaction).index))
   end
 
-  @transaction_types ["COIN_TRANSFER", "CONTRACT_INTERACTION", "CONTRACT_CREATION"]
   defp filter_transaction_by_types(query, nil), do: query
 
   defp filter_transaction_by_types(query, types) do
@@ -795,18 +813,17 @@ defmodule Explorer.Chain.AdvancedFilter do
       query
     else
       dynamic_condition =
-        @transaction_types
+        types
         |> Enum.reduce(nil, fn
-          type, dynamic_condition ->
-            if type in types do
-              filter_transaction_by_type(type, dynamic_condition)
-            else
-              dynamic_condition
-            end
+          type, dynamic_condition when type in @transaction_types ->
+            filter_transaction_by_type(type, dynamic_condition)
+
+          _, dynamic_condition ->
+            dynamic_condition
         end)
 
       query =
-        if "CONTRACT_CREATION" in types and has_named_binding?(query, :to_address) do
+        if "CONTRACT_INTERACTION" in types and not has_named_binding?(query, :to_address) do
           join(query, :left, [t], a in assoc(t, :to_address), as: :to_address)
         else
           query
@@ -857,12 +874,29 @@ defmodule Explorer.Chain.AdvancedFilter do
   defp filter_transactions_by_methods(query, _), do: query
 
   defp filter_token_transfers_by_methods(query_function, [_ | _] = methods) do
-    prepared_methods = prepare_methods(methods)
-
-    fn query, unnested? ->
-      query
-      |> where(fragment("substring(? FOR 4)", as(:transaction).input) in ^prepared_methods)
-      |> query_function.(unnested?)
+    fn query, _unnested? ->
+      from(
+        method_ids in fragment("SELECT unnest(?) as method_id", type(^methods, {:array, Data})),
+        as: :method_ids,
+        cross_lateral_join:
+          token_transfer in subquery(
+            query
+            |> where(
+              as(:transaction).has_token_transfers == true and
+                fragment("substring(? FOR 4)", as(:transaction).input) == parent_as(:method_ids).method_id
+            )
+            |> exclude(:order_by)
+            |> order_by(
+              desc: as(:transaction).block_number,
+              desc: as(:transaction).index,
+              desc: as(:token_transfer).log_index
+            )
+            |> query_function.(true)
+          ),
+        as: :unnested_token_transfer,
+        select: token_transfer,
+        order_by: [desc: token_transfer.block_number, desc: token_transfer.log_index]
+      )
     end
   end
 
